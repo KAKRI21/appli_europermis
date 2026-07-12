@@ -1,11 +1,9 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
-import { GraduationCap, UserCog, ShieldCheck, Loader2 } from "lucide-react";
-import { toast } from "sonner";
+import { Loader2 } from "lucide-react";
 import logoAsset from "@/assets/logo-blanc.webp.asset.json";
-import { type MockRole } from "@/lib/local-auth";
-import { signInWithCredentials } from "@/lib/supabase-auth";
-import { seedDemoAccounts, DEMO_ACCOUNTS } from "@/lib/auth.functions";
+import { login } from "@/lib/auth/auth.functions";
+import type { AppRole } from "@/lib/auth/types";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -21,50 +19,36 @@ export const Route = createFileRoute("/")({
   component: LoginPage,
 });
 
+function goToRole(navigate: ReturnType<typeof useNavigate>, role: AppRole) {
+  if (role === "admin") navigate({ to: "/admin" });
+  else if (role === "instructor") navigate({ to: "/instructor" });
+  else navigate({ to: "/student" });
+}
+
 function LoginPage() {
   const navigate = useNavigate();
-  const [username, setUsername] = useState("");
+  const [usernameOrEmail, setUsernameOrEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [seeding, setSeeding] = useState(false);
 
-  const goToRole = (role: MockRole) => {
-    if (role === "admin") navigate({ to: "/admin" });
-    else if (role === "instructor") navigate({ to: "/instructor" });
-    else navigate({ to: "/student" });
-  };
-
-  const handleSignIn = async (u: string, p: string) => {
+  const handleSignIn = async (e: React.FormEvent) => {
+    e.preventDefault();
     setLoading(true);
     setError(null);
-    const res = await signInWithCredentials(u, p);
-    setLoading(false);
-    if ("error" in res) {
-      setError(res.error);
-      return;
-    }
-    goToRole(res.role);
-  };
-
-  const handleSeed = async () => {
-    setSeeding(true);
     try {
-      await seedDemoAccounts();
-      toast.success("Comptes démo initialisés. Vous pouvez maintenant vous connecter.");
-    } catch (e) {
-      toast.error("Échec : serveur non configuré (SEED_SECRET manquant).");
-      console.error(e);
+      const res = await login({ data: { usernameOrEmail, password } });
+      if (!res.ok) {
+        setError(res.error);
+        return;
+      }
+      goToRole(navigate, res.user.role);
+    } catch (err) {
+      setError("Une erreur est survenue. Réessayez.");
+      console.error(err);
     } finally {
-      setSeeding(false);
+      setLoading(false);
     }
-  };
-
-
-  const demoLogin = (email: string) => {
-    const acc = DEMO_ACCOUNTS.find((a) => a.email === email);
-    if (!acc) return;
-    handleSignIn(acc.email, acc.password);
   };
 
   return (
@@ -82,21 +66,16 @@ function LoginPage() {
           </p>
         </div>
 
-        <form
-          className="mt-8 space-y-3"
-          onSubmit={(e) => {
-            e.preventDefault();
-            handleSignIn(username, password);
-          }}
-        >
+        <form className="mt-8 space-y-3" onSubmit={handleSignIn}>
           <div>
             <label className="mb-1 block text-xs font-medium text-muted-foreground">
-              Email ou identifiant
+              Identifiant ou email
             </label>
             <input
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              placeholder="ex. eleve@europermis.fr"
+              value={usernameOrEmail}
+              onChange={(e) => setUsernameOrEmail(e.target.value)}
+              placeholder="ex. prenom.nom ou email"
+              autoComplete="username"
               className="w-full rounded-xl border border-border bg-card px-4 py-3 text-sm outline-none focus:border-primary"
             />
           </div>
@@ -109,6 +88,7 @@ function LoginPage() {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               placeholder="••••••••"
+              autoComplete="current-password"
               className="w-full rounded-xl border border-border bg-card px-4 py-3 text-sm outline-none focus:border-primary"
             />
           </div>
@@ -127,78 +107,10 @@ function LoginPage() {
           )}
         </form>
 
-        <div className="my-6 flex items-center gap-3">
-          <div className="h-px flex-1 bg-border" />
-          <span className="text-xs uppercase tracking-wider text-muted-foreground">
-            Accès démo
-          </span>
-          <div className="h-px flex-1 bg-border" />
-        </div>
-
-        <div className="space-y-3">
-          <DemoButton
-            label="Tester l'Espace Élève"
-            sub="eleve@europermis.fr"
-            icon={GraduationCap}
-            onClick={() => demoLogin("eleve@europermis.fr")}
-          />
-          <DemoButton
-            label="Tester l'Espace Moniteur"
-            sub="moniteur@europermis.fr"
-            icon={UserCog}
-            onClick={() => demoLogin("moniteur@europermis.fr")}
-          />
-          <DemoButton
-            label="Tester l'Espace Secrétaire (Admin)"
-            sub="admin@europermis.fr"
-            icon={ShieldCheck}
-            onClick={() => demoLogin("admin@europermis.fr")}
-          />
-        </div>
-
-        <button
-          type="button"
-          onClick={handleSeed}
-          disabled={seeding}
-          className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl border border-border bg-card py-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted disabled:opacity-60"
-        >
-          {seeding && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-          Initialiser / réinitialiser les comptes démo
-        </button>
-
         <p className="mt-8 text-center text-[11px] text-muted-foreground">
           56-58 Avenue Paul Valéry, 95200 Sarcelles · 01 34 29 01 54
         </p>
       </div>
     </div>
-  );
-}
-
-function DemoButton({
-  label,
-  sub,
-  icon: Icon,
-  onClick,
-}: {
-  label: string;
-  sub: string;
-  icon: typeof GraduationCap;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="group flex w-full items-center gap-3 rounded-2xl border border-primary/30 bg-primary/10 px-4 py-4 text-left transition-colors hover:bg-primary/20"
-    >
-      <span className="grid h-11 w-11 place-items-center rounded-xl bg-primary text-primary-foreground">
-        <Icon className="h-5 w-5" />
-      </span>
-      <span className="flex-1">
-        <span className="block text-sm font-semibold">🟢 {label}</span>
-        <span className="block text-xs text-muted-foreground">{sub}</span>
-      </span>
-      <span className="text-primary">→</span>
-    </button>
   );
 }

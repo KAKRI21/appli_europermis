@@ -18,16 +18,15 @@ import {
 import { AppShell } from "@/components/AppShell";
 import { BottomNav, type TabItem } from "@/components/BottomNav";
 import { SCHOOL, STUDENT, PRICING } from "@/lib/mock-data";
-import { getActiveSession, getActiveStudentProfile, type StoredStudentProfile } from "@/lib/local-auth";
+import { getCurrentUser } from "@/lib/auth/auth.functions";
+import { getMyStudentProfile, type StudentRecord } from "@/lib/students/queries";
 import { getAppreciationsForStudent } from "@/lib/appreciations";
 
 export const Route = createFileRoute("/student")({
   head: () => ({ meta: [{ title: "Espace Élève — Euro-Permis Sarcelles" }] }),
-  beforeLoad: () => {
-    // SECURITY FIX: Do NOT skip the guard on the server (SSR).
-    // See admin.tsx for full explanation.
-    const session = getActiveSession();
-    if (!session || session.role !== "student") throw redirect({ to: "/" });
+  beforeLoad: async () => {
+    const user = await getCurrentUser();
+    if (!user || user.role !== "student") throw redirect({ to: "/" });
   },
   component: StudentApp,
 });
@@ -43,9 +42,9 @@ const TABS: TabItem<Tab>[] = [
 
 function StudentApp() {
   const [tab, setTab] = useState<Tab>("home");
-  const [activeStudent, setActiveStudent] = useState<StoredStudentProfile | null>(null);
+  const [activeStudent, setActiveStudent] = useState<StudentRecord | null>(null);
   useEffect(() => {
-    setActiveStudent(getActiveStudentProfile());
+    getMyStudentProfile().then(setActiveStudent).catch(() => setActiveStudent(null));
   }, []);
   const firstName = activeStudent?.prenom || "Jean";
   const titles: Record<Tab, string> = {
@@ -73,21 +72,21 @@ function Card({ children, className = "" }: { children: React.ReactNode; classNa
   );
 }
 
-function fullName(student: StoredStudentProfile | null) {
+function fullName(student: StudentRecord | null) {
   return student ? `${student.prenom} ${student.nom}`.trim() : STUDENT.fullName;
 }
 
-function initials(student: StoredStudentProfile | null) {
+function initials(student: StudentRecord | null) {
   return student ? `${student.prenom[0] ?? ""}${student.nom[0] ?? ""}`.toUpperCase() : "JD";
 }
 
-function parseHours(hours?: string) {
+function parseHours(hours?: string | null) {
   const match = (hours ?? "").match(/^(\d+)\/(\d+)/);
   if (!match) return { done: STUDENT.hoursDone, total: STUDENT.hoursTotal };
   return { done: Number(match[1]), total: Number(match[2]) || STUDENT.hoursTotal };
 }
 
-function ProfileLine({ label, value }: { label: string; value: string }) {
+function ProfileLine({ label, value }: { label: string; value: string | null | undefined }) {
   return (
     <div className="flex items-start justify-between gap-3 border-b border-border/60 pb-2 last:border-b-0">
       <span className="shrink-0 text-xs text-muted-foreground">{label}</span>
@@ -96,17 +95,21 @@ function ProfileLine({ label, value }: { label: string; value: string }) {
   );
 }
 
-function StudentHome({ student }: { student: StoredStudentProfile | null }) {
-  const isImported = student?.source === "import";
+// Tant qu'une fiche élève réelle est chargée, on masque le contenu de
+// démonstration (planning fictif, solde fictif, livret fictif...) — ces
+// fonctionnalités ne sont pas encore branchées sur de vraies données.
+// `isReal` remplace l'ancienne notion `source === "import"`.
+function StudentHome({ student }: { student: StudentRecord | null }) {
+  const isReal = !!student;
   const { done, total } = parseHours(student?.hours);
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
   const address = [student?.adresse, student?.codePostal, student?.ville]
     .filter(Boolean)
     .join(", ");
-  const balance = isImported ? 0 : STUDENT.balance;
+  const balance = isReal ? 0 : STUDENT.balance;
   return (
     <div className="space-y-4">
-      {isImported ? (
+      {isReal ? (
         <Card className="bg-gradient-to-br from-muted/40 to-card">
           <p className="text-xs uppercase tracking-wider text-muted-foreground">Prochain cours</p>
           <p className="mt-1 text-sm font-medium text-muted-foreground">
@@ -142,7 +145,7 @@ function StudentHome({ student }: { student: StoredStudentProfile | null }) {
           <p className="text-xs text-muted-foreground">Solde</p>
           <p className="mt-1 text-2xl font-bold">{balance} €</p>
           <p className="mt-2 text-[11px] text-muted-foreground">
-            {isImported ? "Aucune transaction" : "Crédit disponible"}
+            {isReal ? "Aucune transaction" : "Crédit disponible"}
           </p>
         </Card>
       </div>
@@ -209,10 +212,10 @@ function StudentHome({ student }: { student: StoredStudentProfile | null }) {
   );
 }
 
-function StudentPlanning({ student }: { student: StoredStudentProfile | null }) {
-  const isImported = student?.source === "import";
+function StudentPlanning({ student }: { student: StudentRecord | null }) {
+  const isReal = !!student;
   const name = fullName(student);
-  const upcoming = isImported ? [] : STUDENT.upcoming;
+  const upcoming = isReal ? [] : STUDENT.upcoming;
   return (
     <div className="space-y-3">
       <Card>
@@ -246,18 +249,16 @@ function StudentPlanning({ student }: { student: StoredStudentProfile | null }) 
   );
 }
 
-
-function StudentPayment({ student }: { student: StoredStudentProfile | null }) {
-  const isImported = student?.source === "import";
+function StudentPayment({ student }: { student: StudentRecord | null }) {
+  const isReal = !!student;
   const [bought, setBought] = useState(0);
-  const baseBalance = isImported ? 0 : STUDENT.balance;
+  const baseBalance = isReal ? 0 : STUDENT.balance;
   return (
     <div className="space-y-4">
       <Card className="bg-gradient-to-br from-accent/25 to-card">
         <p className="text-xs uppercase tracking-wider text-accent">Solde financier</p>
         <p className="mt-1 text-3xl font-bold">{baseBalance + bought * 60} €</p>
         <p className="text-xs text-muted-foreground">Mis à jour à l'instant</p>
-
       </Card>
 
       <Card>
@@ -316,21 +317,21 @@ function StudentPayment({ student }: { student: StoredStudentProfile | null }) {
   );
 }
 
-function StudentProfile({ student }: { student: StoredStudentProfile | null }) {
-  const isImported = student?.source === "import";
+function StudentProfile({ student }: { student: StudentRecord | null }) {
+  const isReal = !!student;
   const name = fullName(student);
-  const skills = isImported
+  const skills = isReal
     ? STUDENT.skills.map((s) => ({ ...s, done: false }))
     : STUDENT.skills;
-  const documents = isImported ? [] : STUDENT.documents;
-  const displayName = `${student?.prenom ?? ""} ${student?.nom ?? ""}`.trim() || (isImported ? "" : "Jean Dupont");
+  const documents = isReal ? [] : STUDENT.documents;
+  const displayName = `${student?.prenom ?? ""} ${student?.nom ?? ""}`.trim() || (isReal ? "" : "Jean Dupont");
   const extra = getAppreciationsForStudent(displayName).map((a) => ({
     date: a.date,
     type: a.type,
     instructor: a.instructor,
     comment: a.comment,
   }));
-  const baseHistory = isImported ? [] : STUDENT.history;
+  const baseHistory = isReal ? [] : STUDENT.history;
   const history = [...extra, ...baseHistory];
   const address = [student?.adresse, student?.codePostal, student?.ville, student?.pays]
     .filter(Boolean)
@@ -366,7 +367,7 @@ function StudentProfile({ student }: { student: StoredStudentProfile | null }) {
 
       <Card>
         <h2 className="mb-3 text-sm font-semibold">
-          Livret pédagogique{isImported && <span className="ml-2 text-[10px] font-normal text-muted-foreground">· 0 % de progression</span>}
+          Livret pédagogique{isReal && <span className="ml-2 text-[10px] font-normal text-muted-foreground">· 0 % de progression</span>}
         </h2>
         <ul className="space-y-2">
           {skills.map((s) => (
@@ -451,7 +452,6 @@ function StudentProfile({ student }: { student: StoredStudentProfile | null }) {
           </ul>
         )}
       </Card>
-
     </div>
   );
 }

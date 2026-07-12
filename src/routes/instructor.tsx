@@ -1,5 +1,5 @@
 import { createFileRoute, redirect } from "@tanstack/react-router";
-import { getActiveSession } from "@/lib/local-auth";
+import { getCurrentUser } from "@/lib/auth/auth.functions";
 import { useEffect, useMemo, useState } from "react";
 import {
   Home,
@@ -29,7 +29,7 @@ import { AppShell } from "@/components/AppShell";
 import { BottomNav, type TabItem } from "@/components/BottomNav";
 import { INSTRUCTOR } from "@/lib/mock-data";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { getStoredStudents, STUDENTS_STORAGE_KEY } from "@/lib/local-auth";
+import { listStudents } from "@/lib/students/queries";
 import {
   addAppreciation,
   formatShortDate,
@@ -39,11 +39,9 @@ import {
 
 export const Route = createFileRoute("/instructor")({
   head: () => ({ meta: [{ title: "Espace Moniteur — Euro-Permis Sarcelles" }] }),
-  beforeLoad: () => {
-    // SECURITY FIX: Do NOT skip the guard on the server (SSR).
-    // See admin.tsx for full explanation.
-    const session = getActiveSession();
-    if (!session || session.role !== "instructor") throw redirect({ to: "/" });
+  beforeLoad: async () => {
+    const user = await getCurrentUser();
+    if (!user || user.role !== "instructor") throw redirect({ to: "/" });
   },
   component: InstructorApp,
 });
@@ -381,24 +379,13 @@ function InstructorAppreciations() {
   const [comment, setComment] = useState("");
   const [saved, setSaved] = useState(false);
 
-  const [storedStudents, setStoredStudents] = useState(() =>
-    typeof window !== "undefined" ? getStoredStudents() : [],
-  );
+  const [storedStudents, setStoredStudents] = useState<{ prenom: string; nom: string }[]>([]);
 
   useEffect(() => {
     setList(getAppreciations());
-    const refresh = () => setStoredStudents(getStoredStudents());
-    refresh();
-    const onStorage = (e: StorageEvent) => {
-      if (!e.key || e.key === STUDENTS_STORAGE_KEY) refresh();
-    };
-    const onFocus = () => refresh();
-    window.addEventListener("storage", onStorage);
-    window.addEventListener("focus", onFocus);
-    return () => {
-      window.removeEventListener("storage", onStorage);
-      window.removeEventListener("focus", onFocus);
-    };
+    listStudents()
+      .then((rows) => setStoredStudents(rows.map((s) => ({ prenom: s.prenom, nom: s.nom }))))
+      .catch(() => setStoredStudents([]));
   }, []);
 
   // Liste fusionnée : élèves importés/stockés + planning du jour + historique des appréciations

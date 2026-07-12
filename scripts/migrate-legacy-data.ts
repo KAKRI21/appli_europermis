@@ -28,6 +28,11 @@ import { profiles, credentials, students, userRoles } from "../src/db/schema";
 import { hashPassword, generateTemporaryPassword } from "../src/lib/auth/password.server";
 import { eq } from "drizzle-orm";
 
+async function nephExistsInDb(neph: string): Promise<boolean> {
+  const rows = await db.select({ id: students.id }).from(students).where(eq(students.neph, neph)).limit(1);
+  return rows.length > 0;
+}
+
 type Row = Record<string, string>;
 
 function parseCsv(content: string, delimiter = ";"): Row[] {
@@ -73,6 +78,8 @@ async function main() {
   let createdProfiles = 0;
   let skippedNoRole = 0;
   let orphanStudentsWithoutProfile = 0;
+  const duplicateNephWarnings: { userId: string; displayName: string; neph: string }[] = [];
+  const seenNephs = new Set<string>();
 
   for (const p of profilesCsv) {
     const role = rolesByUserId.get(p.id);
@@ -114,6 +121,25 @@ async function main() {
 
     if (role === "student") {
       if (studentRow) {
+        const rawNeph = studentRow.neph?.trim() || "";
+        let nephToInsert: string | null = rawNeph || null;
+
+        if (rawNeph && (seenNephs.has(rawNeph) || (await nephExistsInDb(rawNeph)))) {
+          // NEPH déjà utilisé — soit par un profil migré plus tôt dans ce
+          // run, soit déjà présent en base (ex: run précédent partiel avant
+          // correctif). On insère quand même la fiche élève, mais SANS le
+          // NEPH (pour ne pas violer la contrainte unique), et on le
+          // signale dans le rapport final pour un nettoyage manuel ultérieur.
+          duplicateNephWarnings.push({
+            userId: p.id,
+            displayName: p.display_name || `${studentRow.prenom} ${studentRow.nom}`,
+            neph: rawNeph,
+          });
+          nephToInsert = null;
+        } else if (rawNeph) {
+          seenNephs.add(rawNeph);
+        }
+
         await db.insert(students).values({
           userId: p.id,
           civilite: studentRow.civilite || null,
@@ -123,7 +149,7 @@ async function main() {
           lieuNaissance: studentRow.lieu_naissance || null,
           departementNaissance: studentRow.departement_naissance || null,
           paysNaissance: studentRow.pays_naissance || null,
-          neph: studentRow.neph || null,
+          neph: nephToInsert,
           datePremierPermis: studentRow.date_premier_permis || null,
           pkg: studentRow.pkg || "À définir",
           hours: studentRow.hours || "0/20",
@@ -155,10 +181,19 @@ async function main() {
   }
   writeFileSync("./credentials-a-distribuer.csv", csvLines.join("\n"), "utf-8");
 
+  if (duplicateNephWarnings.length > 0) {
+    const dupLines = ["user_id;display_name;neph_en_double"];
+    for (const d of duplicateNephWarnings) {
+      dupLines.push(`${d.userId};${d.displayName};${d.neph}`);
+    }
+    writeFileSync("./neph-en-double-a-verifier.csv", dupLines.join("\n"), "utf-8");
+  }
+
   console.log("\n=== Résumé ===");
   console.log(`Profils créés     : ${createdProfiles}`);
   console.log(`Ignorés (no role) : ${skippedNoRole}`);
   console.log(`Élèves orphelins  : ${orphanStudentsWithoutProfile} (compte créé, fiche à compléter)`);
+  console.log(`NEPH en double    : ${duplicateNephWarnings.length} (compte créé SANS neph, voir ./neph-en-double-a-verifier.csv)`);
   console.log(`\n→ Mots de passe temporaires écrits dans ./credentials-a-distribuer.csv`);
   console.log(`  SÉCURITÉ : distribue ce fichier par un canal sécurisé puis SUPPRIME-le.`);
 }

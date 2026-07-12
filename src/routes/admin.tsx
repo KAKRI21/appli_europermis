@@ -1,5 +1,5 @@
 import { createFileRoute, redirect } from "@tanstack/react-router";
-import { getActiveSession } from "@/lib/local-auth";
+import { getCurrentUser } from "@/lib/auth/auth.functions";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
@@ -8,7 +8,6 @@ import {
   Upload,
   ChevronLeft,
   ChevronRight,
-  Database,
   FileSpreadsheet,
   FileUp,
   CalendarClock,
@@ -32,19 +31,20 @@ import { AppShell } from "@/components/AppShell";
 import { BottomNav, type TabItem } from "@/components/BottomNav";
 import { INSTRUCTORS, PLANNING } from "@/lib/mock-data";
 import {
-  clearActiveStudentSession,
-  getStoredStudents,
-  saveStoredStudents,
-  STUDENTS_STORAGE_KEY,
-  syncStudentAuthUsers,
-  type StoredStudentProfile,
-} from "@/lib/local-auth";
-import { provisionAccounts, resetStudentAccounts, type ProvisionInput } from "@/lib/provision.functions";
+  listStudents,
+  deleteStudent as deleteStudentServer,
+  resetAllStudents,
+  resetStudentPassword,
+  createStudentsFromRows,
+  type StudentRecord,
+  type ManualStudentRow,
+} from "@/lib/students/queries";
+import { importRapidoStudents } from "@/lib/rapido/import.functions";
 
 type SortKey = "recent" | "nameAsc" | "nameDesc" | "city";
 type StatusFilter = "all" | "active" | "inactive";
 
-function isActiveStudent(s: StoredStudentProfile) {
+function isActiveStudent(s: StudentRecord) {
   const m = (s.hours ?? "").match(/^(\d+)\//);
   if (!m) return false;
   return Number(m[1]) > 0;
@@ -52,16 +52,9 @@ function isActiveStudent(s: StoredStudentProfile) {
 
 export const Route = createFileRoute("/admin")({
   head: () => ({ meta: [{ title: "Espace Admin — Euro-Permis Sarcelles" }] }),
-  beforeLoad: () => {
-    // SECURITY FIX: Do NOT skip the guard on the server (SSR).
-    // Returning early when `window === undefined` allows the server to render
-    // and send the full protected HTML to unauthenticated HTTP requests.
-    // Instead, we check the session on both client and server.
-    // On the server the session will always be null (no localStorage),
-    // so SSR of protected routes is intentionally disabled — the redirect
-    // fires immediately and the client handles the authenticated render.
-    const session = getActiveSession();
-    if (!session || session.role !== "admin") throw redirect({ to: "/" });
+  beforeLoad: async () => {
+    const user = await getCurrentUser();
+    if (!user || user.role !== "admin") throw redirect({ to: "/" });
   },
   component: AdminApp,
 });
@@ -74,63 +67,32 @@ const TABS: TabItem<Tab>[] = [
   { id: "import", label: "Import", icon: Upload },
 ];
 
-// ---- Types & seed ----------------------------------------------------------
+// ---- Types -------------------------------------------------------------
 
-export type ManagedStudent = StoredStudentProfile;
-
-const SEED_STUDENTS: ManagedStudent[] = [
-  { civilite: "M.", nom: "Dupont", prenom: "Jean", dateNaissance: "12/03/2004", lieuNaissance: "Sarcelles", neph: "0123456789", pkg: "Permis B 20h", hours: "14/20" },
-  { civilite: "Mme", nom: "Traoré", prenom: "Aïcha", dateNaissance: "07/11/2003", lieuNaissance: "Paris", neph: "0223456712", pkg: "Permis B 30h", hours: "22/30" },
-  { civilite: "M.", nom: "Lefèvre", prenom: "Marc", dateNaissance: "23/05/2002", lieuNaissance: "Garges-lès-Gonesse", neph: "0392345621", pkg: "Automatique 13h", hours: "11/13" },
-  { civilite: "Mme", nom: "Martin", prenom: "Léa", dateNaissance: "01/09/2005", lieuNaissance: "Sarcelles", neph: "0411223344", pkg: "Code illimité", hours: "—" },
-  { civilite: "M.", nom: "Kessab", prenom: "Yanis", dateNaissance: "30/06/2006", lieuNaissance: "Villiers-le-Bel", neph: "0556677889", pkg: "Permis B 20h", hours: "06/20" },
-].map((s) => ({
-  ...s,
-  id: s.neph,
-  username: makeUsername(s.prenom, s.nom),
-  password: s.neph,
-  source: "seed" as const,
-}));
-
-function makeUsername(prenom: string, nom: string) {
-  const norm = (s: string) =>
-    s
-      .toLowerCase()
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .replace(/[^a-z0-9]/g, "");
-  return `${norm(prenom)}.${norm(nom)}`;
-}
+export type ManagedStudent = StudentRecord;
 
 // ---- Root ------------------------------------------------------------------
 
 function AdminApp() {
   const [tab, setTab] = useState<Tab>("planning");
-  const [students, setStudents] = useState<ManagedStudent[]>(SEED_STUDENTS);
+  const [students, setStudents] = useState<ManagedStudent[]>([]);
   const [openStudent, setOpenStudent] = useState<ManagedStudent | null>(null);
-  const [hydrated, setHydrated] = useState(false);
+  const [loading, setLoading] = useState(true);
 
-  // Hydration depuis localStorage au montage
+  const refresh = () => {
+    setLoading(true);
+    listStudents()
+      .then(setStudents)
+      .catch((err) => {
+        console.error("[listStudents] failed", err);
+        toast.error("Impossible de charger la liste des élèves.");
+      })
+      .finally(() => setLoading(false));
+  };
+
   useEffect(() => {
-    try {
-      const parsed = getStoredStudents();
-      if (parsed.length > 0) setStudents(parsed);
-    } catch {
-      /* ignore */
-    }
-    setHydrated(true);
+    refresh();
   }, []);
-
-  // Persistance à chaque changement (après hydratation)
-  useEffect(() => {
-    if (!hydrated) return;
-    try {
-      saveStoredStudents(students);
-      syncStudentAuthUsers(students);
-    } catch {
-      /* ignore */
-    }
-  }, [students, hydrated]);
 
   const titles: Record<Tab, string> = {
     planning: "Planning général",
@@ -138,126 +100,92 @@ function AdminApp() {
     import: "Synchronisation",
   };
 
-  const addImported = (rows: Omit<ManagedStudent, "id" | "username" | "password" | "pkg" | "hours" | "source">[]) => {
-    // Build a full ManagedStudent for every imported row (whether or not it's
-    // already known locally). Local dedup only affects the in-memory list —
-    // Cloud provisioning always runs for the whole batch, and the server
-    // handler is idempotent (skips existing accounts, never resets them).
-    const allBuilt: ManagedStudent[] = rows.map((r, i) => ({
-      ...r,
-      id: r.neph || crypto.randomUUID(),
-      username: makeUsername(r.prenom, r.nom),
-      password: r.neph && r.neph.length >= 6 ? r.neph : `${r.neph || "tmp"}Demo!`,
-      pkg: "À définir",
-      hours: "0/20",
-      source: "import",
-      createdAt: Date.now() + i,
-    }));
-
-    let added = 0;
-    setStudents((prev) => {
-      const byNeph = new Map(prev.map((s) => [s.neph, s]));
-      for (const created of allBuilt) {
-        if (created.neph && byNeph.has(created.neph)) continue;
-        byNeph.set(created.neph, created);
-        added++;
-      }
-      return Array.from(byNeph.values());
-    });
-
-    toast.success(
-      added === 0
-        ? `${allBuilt.length} ligne(s) déjà connues localement — synchronisation Cloud lancée.`
-        : `${added} nouvel(s) élève(s) ajouté(s) localement.`,
-    );
-    setTab("students");
-
-    if (allBuilt.length === 0) return;
-
-    const users: ProvisionInput[] = allBuilt.map((s) => ({
-      role: "student",
-      email: (s.email && s.email.includes("@") ? s.email : `${s.username}@eleves.europermis.fr`).toLowerCase(),
-      password: (s.password && s.password.length >= 6) ? s.password : `${s.password}Demo!`,
-      firstName: s.prenom,
-      lastName: s.nom,
-      displayName: `${s.prenom} ${s.nom}`.trim(),
-      student: {
-        civilite: s.civilite,
-        dateNaissance: s.dateNaissance,
-        lieuNaissance: s.lieuNaissance,
-        departementNaissance: s.departementNaissance,
-        paysNaissance: s.paysNaissance,
-        neph: s.neph,
-        pkg: s.pkg,
-        hours: s.hours,
-        adresse: s.adresse,
-        codePostal: s.codePostal,
-        ville: s.ville,
-        pays: s.pays,
-        telephone: s.telephone,
-        username: s.username,
-        datePremierPermis: s.datePremierPermis,
-        source: "import",
-      },
-    }));
-
-    toast.info(`Création des comptes Cloud (${users.length}) en cours…`);
-    provisionAccounts({ data: { users, resetPassword: true } })
+  // Import "manuel" (onglets JSON/CSV) : lignes déjà structurées côté client.
+  const addManualRows = (rows: ManualStudentRow[]) => {
+    toast.info(`Création de ${rows.length} compte(s) en cours…`);
+    createStudentsFromRows({ data: { rows } })
       .then((res) => {
-        const c = res.created.length;
-        const sk = res.skipped.length;
-        const er = res.errors.length;
-        console.log("[provisionAccounts] result", res);
-        if (er > 0) {
-          toast.error(`Comptes Cloud : ${c} créés, ${sk} déjà existants, ${er} en erreur. Voir console.`);
-          console.error("Provision errors:", res.errors);
+        if (res.errors.length > 0) {
+          toast.error(`${res.created} créé(s), ${res.skippedDuplicate} déjà connu(s) (NEPH), ${res.errors.length} en erreur.`);
+          console.error("[createStudentsFromRows] errors", res.errors);
         } else {
-          toast.success(`Comptes Cloud : ${c} créés${sk > 0 ? `, ${sk} déjà existants` : ""}.`);
+          toast.success(`${res.created} élève(s) créé(s)${res.skippedDuplicate > 0 ? `, ${res.skippedDuplicate} déjà existants (NEPH)` : ""}.`);
         }
+        refresh();
+        setTab("students");
       })
       .catch((err) => {
-        console.error("[provisionAccounts] failed", err);
-        toast.error(`Échec Cloud : ${err instanceof Error ? err.message : "droits admin requis"}.`);
+        console.error("[createStudentsFromRows] failed", err);
+        toast.error(`Échec : ${err instanceof Error ? err.message : "erreur serveur"}.`);
       });
   };
 
+  // Import Rapido réel (onglet EXPORT.TXT) : le texte brut du fichier est
+  // envoyé tel quel au serveur, qui le reparse avec le parseur officiel
+  // Rapido (voir src/lib/rapido/parser.ts) — la déduplication par NEPH est
+  // gérée serveur, contre TOUTE la base (pas seulement ce lot).
+  const addRapidoFile = (fileContent: string, fileName: string) => {
+    toast.info("Import du fichier en cours…");
+    importRapidoStudents({ data: { fileContent, fileName } })
+      .then((report) => {
+        if (report.errors.length > 0) {
+          toast.error(
+            `${report.created} créé(s), ${report.updated} mis à jour, ${report.skippedErrors} en erreur sur ${report.totalRows} lignes.`,
+          );
+          console.error("[importRapidoStudents] errors", report.errors);
+        } else {
+          toast.success(`${report.created} créé(s), ${report.updated} mis à jour sur ${report.totalRows} lignes.`);
+        }
+        if (report.temporaryCredentials.length > 0) {
+          console.log("Mots de passe temporaires (nouveaux comptes) :", report.temporaryCredentials);
+          toast.info("Mots de passe temporaires générés — voir la console pour les récupérer et les transmettre aux élèves.");
+        }
+        refresh();
+        setTab("students");
+      })
+      .catch((err) => {
+        console.error("[importRapidoStudents] failed", err);
+        toast.error(`Échec de l'import : ${err instanceof Error ? err.message : "erreur serveur"}.`);
+      });
+  };
 
-  const deleteStudent = (id: string) => {
-    setStudents((prev) => prev.filter((s) => s.id !== id));
-    clearActiveStudentSession(id);
-    setOpenStudent(null);
-    toast.success("Élève supprimé.");
+  const deleteStudent = (userId: string) => {
+    deleteStudentServer({ data: { userId } })
+      .then(() => {
+        setStudents((prev) => prev.filter((s) => s.userId !== userId));
+        setOpenStudent(null);
+        toast.success("Élève supprimé.");
+      })
+      .catch((err) => {
+        console.error("[deleteStudent] failed", err);
+        toast.error(`Échec de la suppression : ${err instanceof Error ? err.message : "erreur serveur"}.`);
+      });
+  };
+
+  const resetPassword = (userId: string) => {
+    resetStudentPassword({ data: { userId } })
+      .then((res) => {
+        toast.success(`Nouveau mot de passe généré : ${res.temporaryPassword}`, { duration: 15000 });
+      })
+      .catch((err) => {
+        console.error("[resetStudentPassword] failed", err);
+        toast.error(`Échec : ${err instanceof Error ? err.message : "erreur serveur"}.`);
+      });
   };
 
   const resetAll = () => {
     if (!window.confirm(
-      "Réinitialisation TOTALE des élèves : les comptes Cloud (auth + rôles + fiches) seront supprimés. Continuer ?",
+      "Réinitialisation TOTALE des élèves : tous les comptes élèves (auth + rôles + fiches) seront supprimés définitivement. Continuer ?",
     )) return;
-    setStudents([]);
-    try {
-      localStorage.removeItem(STUDENTS_STORAGE_KEY);
-      syncStudentAuthUsers([]);
-      clearActiveStudentSession();
-    } catch {
-      /* ignore */
-    }
-    toast.info("Suppression des comptes élèves côté Cloud…");
-    resetStudentAccounts()
+    toast.info("Suppression des comptes élèves en cours…");
+    resetAllStudents()
       .then((res) => {
-        console.log("[resetStudentAccounts]", res);
-        if (res.errors.length > 0) {
-          toast.error(
-            `Réinit. partielle : ${res.deletedAuth} comptes supprimés, ${res.errors.length} en erreur.`,
-          );
-        } else {
-          toast.success(
-            `Réinit. Cloud : ${res.deletedAuth} comptes supprimés, ${res.deletedStudents} fiches purgées.`,
-          );
-        }
+        setStudents([]);
+        toast.success(`${res.deleted} compte(s) élève(s) supprimé(s).`);
       })
       .catch((err) => {
-        console.error("[resetStudentAccounts] failed", err);
-        toast.error(`Échec Cloud : ${err instanceof Error ? err.message : "droits admin requis"}.`);
+        console.error("[resetAllStudents] failed", err);
+        toast.error(`Échec : ${err instanceof Error ? err.message : "erreur serveur"}.`);
       });
   };
 
@@ -268,18 +196,20 @@ function AdminApp() {
         {tab === "students" && (
           <AdminStudents
             students={students}
+            loading={loading}
             onOpen={setOpenStudent}
             onDelete={deleteStudent}
             onResetAll={resetAll}
           />
         )}
-        {tab === "import" && <AdminImport onValidate={addImported} />}
+        {tab === "import" && <AdminImport onValidateManual={addManualRows} onValidateRapido={addRapidoFile} />}
       </AppShell>
       <BottomNav items={TABS} active={tab} onChange={setTab} />
       <StudentDetailDialog
         student={openStudent}
         onClose={() => setOpenStudent(null)}
         onDelete={deleteStudent}
+        onResetPassword={resetPassword}
       />
     </>
   );
@@ -460,13 +390,15 @@ function InstructorColumn({ name, date }: { name: string; date: Date }) {
 
 function AdminStudents({
   students,
+  loading,
   onOpen,
   onDelete,
   onResetAll,
 }: {
   students: ManagedStudent[];
+  loading: boolean;
   onOpen: (s: ManagedStudent) => void;
-  onDelete: (id: string) => void;
+  onDelete: (userId: string) => void;
   onResetAll: () => void;
 }) {
   const [query, setQuery] = useState("");
@@ -512,13 +444,11 @@ function AdminStudents({
         return ka.localeCompare(kb, "fr", opts);
       });
     } else {
-      // Récents : les plus récemment ajoutés en haut (createdAt desc), seeds en dernier
+      // Récents : les plus récemment créés en base en premier.
       sorted.sort((a, b) => {
-        const ta = a.createdAt ?? 0;
-        const tb = b.createdAt ?? 0;
-        if (ta !== tb) return tb - ta;
-        if (a.source !== b.source) return a.source === "import" ? -1 : 1;
-        return 0;
+        const ta = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+        const tb = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+        return tb - ta;
       });
     }
     return sorted;
@@ -603,17 +533,23 @@ function AdminStudents({
 
 
 
-      {filtered.length === 0 && (
+      {loading && (
+        <div className="rounded-2xl border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
+          Chargement des élèves…
+        </div>
+      )}
+
+      {!loading && filtered.length === 0 && (
         <div className="rounded-2xl border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
           {students.length === 0
-            ? "Aucun élève. Importez un fichier .txt pour démarrer."
+            ? "Aucun élève. Importez un fichier depuis l'onglet Import pour démarrer."
             : "Aucun élève ne correspond à la recherche."}
         </div>
       )}
 
       {filtered.map((s) => (
         <div
-          key={s.id}
+          key={s.userId}
           className="flex items-center gap-3 rounded-2xl border border-border bg-card p-3 transition hover:border-primary/60 hover:bg-secondary/50"
         >
           <button
@@ -629,7 +565,7 @@ function AdminStudents({
                 <p className="truncate text-sm font-semibold">
                   {s.prenom} {s.nom}
                 </p>
-                {s.source === "import" && (
+                {s.source === "rapido" && (
                   <span className="rounded-full bg-accent/20 px-1.5 py-0.5 text-[9px] font-semibold uppercase text-accent">
                     Nouveau
                   </span>
@@ -648,7 +584,7 @@ function AdminStudents({
           <button
             type="button"
             onClick={() => {
-              if (window.confirm(`Supprimer ${s.prenom} ${s.nom} ?`)) onDelete(s.id);
+              if (window.confirm(`Supprimer ${s.prenom} ${s.nom} ?`)) onDelete(s.userId);
             }}
             className="grid h-9 w-9 shrink-0 place-items-center rounded-xl border border-destructive/30 bg-destructive/10 text-destructive transition hover:bg-destructive/20"
             aria-label={`Supprimer ${s.prenom} ${s.nom}`}
@@ -666,10 +602,12 @@ function StudentDetailDialog({
   student,
   onClose,
   onDelete,
+  onResetPassword,
 }: {
   student: ManagedStudent | null;
   onClose: () => void;
-  onDelete: (id: string) => void;
+  onDelete: (userId: string) => void;
+  onResetPassword: (userId: string) => void;
 }) {
   return (
     <Dialog open={!!student} onOpenChange={(o) => !o && onClose()}>
@@ -735,11 +673,21 @@ function StudentDetailDialog({
                 <div className="mb-2 flex items-center gap-2 text-primary">
                   <KeyRound className="h-4 w-4" />
                   <p className="text-xs font-semibold uppercase tracking-wider">
-                    Compte utilisateur généré
+                    Compte utilisateur
                   </p>
                 </div>
                 <InfoRow label="Identifiant" value={student.username} mono />
-                <InfoRow label="Mot de passe" value={student.password} mono />
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (window.confirm(`Générer un nouveau mot de passe temporaire pour ${student.prenom} ${student.nom} ?`)) {
+                      onResetPassword(student.userId);
+                    }
+                  }}
+                  className="mt-2 inline-flex w-full items-center justify-center gap-2 rounded-lg border border-primary/40 bg-background px-3 py-2 text-xs font-semibold text-primary transition hover:bg-primary/10"
+                >
+                  <KeyRound className="h-3.5 w-3.5" /> Réinitialiser le mot de passe
+                </button>
               </div>
 
               <div className="mt-2 grid grid-cols-2 gap-2">
@@ -751,7 +699,7 @@ function StudentDetailDialog({
                         `Supprimer ${student.prenom} ${student.nom} ?`,
                       )
                     )
-                      onDelete(student.id);
+                      onDelete(student.userId);
                   }}
                   className="inline-flex items-center justify-center gap-2 rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-2.5 text-sm font-semibold text-destructive transition hover:bg-destructive/20"
                 >
@@ -973,31 +921,29 @@ function parseCsvStudents(text: string): ImportedStudent[] {
   return out;
 }
 
-type ImportMode = "txt" | "json" | "rapido";
+type ImportMode = "txt" | "json";
 
 function AdminImport({
-  onValidate,
+  onValidateManual,
+  onValidateRapido,
 }: {
-  onValidate: (rows: ImportedStudent[]) => void;
+  onValidateManual: (rows: ImportedStudent[]) => void;
+  onValidateRapido: (fileContent: string, fileName: string) => void;
 }) {
   const [mode, setMode] = useState<ImportMode>("txt");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [fileName, setFileName] = useState<string | null>(null);
+  const [rawText, setRawText] = useState<string | null>(null);
   const [students, setStudents] = useState<ImportedStudent[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [sortAsc, setSortAsc] = useState(true);
-
-  // Rapido state
-  const [rapidoKey, setRapidoKey] = useState("");
-  const [rapidoEtab, setRapidoEtab] = useState("");
-  const [rapidoEnabled, setRapidoEnabled] = useState(false);
-  const [rapidoLoading, setRapidoLoading] = useState(false);
 
   const sortedPreview = useMemo(() => students, [students]);
 
   const reset = () => {
     setStudents([]);
     setFileName(null);
+    setRawText(null);
     setError(null);
   };
 
@@ -1019,6 +965,7 @@ function AdminImport({
     reader.onload = (e) => {
       try {
         const text = String(e.target?.result ?? "");
+        if (isTxt) setRawText(text);
         const parsed = isJson
           ? parseJsonStudents(text)
           : isCsv
@@ -1028,6 +975,7 @@ function AdminImport({
         setFileName(file.name);
       } catch (err) {
         setStudents([]);
+        setRawText(null);
         setFileName(file.name);
         setError(err instanceof Error ? err.message : "Erreur de lecture");
       }
@@ -1037,8 +985,13 @@ function AdminImport({
   };
 
   const launchImport = () => {
-    if (students.length === 0) return;
-    onValidate(students);
+    if (mode === "txt") {
+      if (!rawText || !fileName) return;
+      onValidateRapido(rawText, fileName);
+    } else {
+      if (students.length === 0) return;
+      onValidateManual(students);
+    }
     reset();
   };
 
@@ -1057,24 +1010,6 @@ function AdminImport({
     toast(`Tri par date de naissance (${sortAsc ? "croissant" : "décroissant"}).`);
   };
 
-  const syncRapido = async () => {
-    if (!rapidoEnabled) {
-      toast.error("Activez d'abord la connexion API Rapido.");
-      return;
-    }
-    setRapidoLoading(true);
-    try {
-      const { fetchRapidoStudents } = await import("@/lib/rapido");
-      const list = await fetchRapidoStudents({ apiKey: rapidoKey, etablissementId: rapidoEtab });
-      onValidate(list);
-      toast.success(`${list.length} élève${list.length > 1 ? "s" : ""} synchronisé${list.length > 1 ? "s" : ""} avec succès depuis Rapido`);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Échec de la synchronisation Rapido.");
-    } finally {
-      setRapidoLoading(false);
-    }
-  };
-
   const status = error
     ? { icon: <XCircle className="h-4 w-4" />, text: error, cls: "border-destructive/40 bg-destructive/10 text-destructive" }
     : students.length > 0
@@ -1084,9 +1019,8 @@ function AdminImport({
   const acceptAttr = mode === "txt" ? ".txt,text/plain" : ".json,.csv,application/json,text/csv";
 
   const tabs: { id: ImportMode; label: string; icon: typeof FileText }[] = [
-    { id: "txt", label: "EXPORT.TXT", icon: FileText },
+    { id: "txt", label: "Export Rapido (.txt)", icon: FileText },
     { id: "json", label: "JSON / CSV", icon: FileSpreadsheet },
-    { id: "rapido", label: "API Rapido", icon: Database },
   ];
 
   return (
@@ -1094,11 +1028,11 @@ function AdminImport({
       <div className="rounded-2xl border border-accent/40 bg-gradient-to-br from-accent/15 to-card p-4">
         <p className="text-xs uppercase tracking-wider text-accent">Sources d'importation</p>
         <p className="mt-1 text-sm">
-          Trois méthodes alimentent la même base élèves (persistée localement).
+          Export .txt depuis Rapido (Dossier de l'élève → Export), ou fichier JSON/CSV structuré. Les deux créent directement les comptes en base.
         </p>
       </div>
 
-      <div className="grid grid-cols-3 gap-2 rounded-2xl border border-border bg-card p-1">
+      <div className="grid grid-cols-2 gap-2 rounded-2xl border border-border bg-card p-1">
         {tabs.map((t) => {
           const Icon = t.icon;
           const active = mode === t.id;
@@ -1116,14 +1050,13 @@ function AdminImport({
         })}
       </div>
 
-      {mode !== "rapido" && (
-        <>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept={acceptAttr}
-            className="sr-only"
-            onChange={(e) => {
+      <>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept={acceptAttr}
+          className="sr-only"
+          onChange={(e) => {
               const f = e.target.files?.[0];
               if (f) handleFile(f);
               e.target.value = "";
@@ -1204,66 +1137,6 @@ function AdminImport({
             </div>
           )}
         </>
-      )}
-
-      {mode === "rapido" && (
-        <div className="space-y-3 rounded-2xl border border-primary/30 bg-card p-4">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <p className="text-sm font-semibold">Connexion Synchronisée API Rapido</p>
-              <p className="text-xs text-muted-foreground">Codes Rousseau · synchronisation des comptes élèves</p>
-            </div>
-            <label className="inline-flex cursor-pointer items-center gap-2">
-              <span className="text-xs text-muted-foreground">{rapidoEnabled ? "Activé" : "Inactif"}</span>
-              <input
-                type="checkbox"
-                checked={rapidoEnabled}
-                onChange={(e) => setRapidoEnabled(e.target.checked)}
-                className="h-5 w-9 cursor-pointer appearance-none rounded-full bg-secondary transition checked:bg-primary"
-              />
-            </label>
-          </div>
-
-          <div className="grid gap-3 sm:grid-cols-2">
-            <label className="block text-xs">
-              <span className="mb-1 block font-semibold text-muted-foreground">Clé API Rapido</span>
-              <input
-                type="text"
-                value={rapidoKey}
-                onChange={(e) => setRapidoKey(e.target.value)}
-                disabled={!rapidoEnabled}
-                placeholder="rk_xxx..."
-                className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm disabled:opacity-50"
-              />
-            </label>
-            <label className="block text-xs">
-              <span className="mb-1 block font-semibold text-muted-foreground">Identifiant Établissement</span>
-              <input
-                type="text"
-                value={rapidoEtab}
-                onChange={(e) => setRapidoEtab(e.target.value)}
-                disabled={!rapidoEnabled}
-                placeholder="EP-SARCELLES-001"
-                className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm disabled:opacity-50"
-              />
-            </label>
-          </div>
-
-          <button
-            type="button"
-            onClick={syncRapido}
-            disabled={!rapidoEnabled || rapidoLoading || !rapidoKey.trim() || !rapidoEtab.trim()}
-            className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-primary px-4 py-3 text-sm font-semibold text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            <RotateCcw className={`h-4 w-4 ${rapidoLoading ? "animate-spin" : ""}`} />
-            {rapidoLoading ? "Synchronisation…" : "🔄 Synchroniser via l'API Rapido"}
-          </button>
-
-          <p className="rounded-xl border border-border bg-secondary/40 p-3 text-xs text-muted-foreground">
-            Les élèves récupérés sont créés avec un profil vierge, un identifiant <code>prenom.nom</code> et un mot de passe temporaire basé sur le NEPH. Ils apparaissent immédiatement dans <strong>Gestion élèves</strong>.
-          </p>
-        </div>
-      )}
     </div>
   );
 }
