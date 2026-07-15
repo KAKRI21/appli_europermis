@@ -20,6 +20,9 @@ import {
   Search,
   Trash2,
   RotateCcw,
+  UserPlus,
+  Phone,
+  BadgeCheck,
 } from "lucide-react";
 import {
   Dialog,
@@ -40,6 +43,12 @@ import {
   type ManualStudentRow,
 } from "@/lib/students/queries";
 import { importRapidoStudents } from "@/lib/rapido/import.functions";
+import {
+  listInstructors,
+  createInstructor,
+  deleteInstructor as deleteInstructorServer,
+  type InstructorRecord,
+} from "@/lib/instructors/queries";
 
 type SortKey = "recent" | "nameAsc" | "nameDesc" | "city";
 type StatusFilter = "all" | "active" | "inactive";
@@ -59,11 +68,12 @@ export const Route = createFileRoute("/admin")({
   component: AdminApp,
 });
 
-type Tab = "planning" | "students" | "import";
+type Tab = "planning" | "students" | "instructors" | "import";
 
 const TABS: TabItem<Tab>[] = [
   { id: "planning", label: "Planning", icon: CalendarDays },
   { id: "students", label: "Élèves", icon: Users },
+  { id: "instructors", label: "Moniteurs", icon: UserPlus },
   { id: "import", label: "Import", icon: Upload },
 ];
 
@@ -78,6 +88,23 @@ function AdminApp() {
   const [students, setStudents] = useState<ManagedStudent[]>([]);
   const [openStudent, setOpenStudent] = useState<ManagedStudent | null>(null);
   const [loading, setLoading] = useState(true);
+  const [instructorsList, setInstructorsList] = useState<InstructorRecord[]>([]);
+  const [instructorsLoading, setInstructorsLoading] = useState(true);
+
+  const refreshInstructors = () => {
+    setInstructorsLoading(true);
+    listInstructors()
+      .then(setInstructorsList)
+      .catch((err) => {
+        console.error("[listInstructors] failed", err);
+        toast.error("Impossible de charger la liste des moniteurs.");
+      })
+      .finally(() => setInstructorsLoading(false));
+  };
+
+  useEffect(() => {
+    refreshInstructors();
+  }, []);
 
   const refresh = () => {
     setLoading(true);
@@ -97,6 +124,7 @@ function AdminApp() {
   const titles: Record<Tab, string> = {
     planning: "Planning général",
     students: "Gestion élèves",
+    instructors: "Gestion moniteurs",
     import: "Synchronisation",
   };
 
@@ -189,6 +217,32 @@ function AdminApp() {
       });
   };
 
+  const addInstructor = (input: { nom: string; prenom: string; email: string; telephone: string; numeroAutorisation: string }) => {
+    return createInstructor({ data: input })
+      .then((res) => {
+        toast.success(`Moniteur créé : identifiant "${res.username}", mot de passe temporaire ${res.temporaryPassword}`, { duration: 20000 });
+        refreshInstructors();
+      })
+      .catch((err) => {
+        console.error("[createInstructor] failed", err);
+        toast.error(`Échec : ${err instanceof Error ? err.message : "erreur serveur"}.`);
+        throw err;
+      });
+  };
+
+  const removeInstructor = (userId: string) => {
+    if (!window.confirm("Supprimer ce moniteur ? Cette action est définitive.")) return;
+    deleteInstructorServer({ data: { userId } })
+      .then(() => {
+        setInstructorsList((prev) => prev.filter((i) => i.userId !== userId));
+        toast.success("Moniteur supprimé.");
+      })
+      .catch((err) => {
+        console.error("[deleteInstructor] failed", err);
+        toast.error(`Échec de la suppression : ${err instanceof Error ? err.message : "erreur serveur"}.`);
+      });
+  };
+
   return (
     <>
       <AppShell title={titles[tab]} subtitle="Secrétariat · Admin">
@@ -200,6 +254,14 @@ function AdminApp() {
             onOpen={setOpenStudent}
             onDelete={deleteStudent}
             onResetAll={resetAll}
+          />
+        )}
+        {tab === "instructors" && (
+          <AdminInstructors
+            instructors={instructorsList}
+            loading={instructorsLoading}
+            onCreate={addInstructor}
+            onDelete={removeInstructor}
           />
         )}
         {tab === "import" && <AdminImport onValidateManual={addManualRows} onValidateRapido={addRapidoFile} />}
@@ -1137,6 +1199,193 @@ function AdminImport({
             </div>
           )}
         </>
+    </div>
+  );
+}
+
+// ---- Moniteurs ---------------------------------------------------------
+
+function AdminInstructors({
+  instructors,
+  loading,
+  onCreate,
+  onDelete,
+}: {
+  instructors: InstructorRecord[];
+  loading: boolean;
+  onCreate: (input: { nom: string; prenom: string; email: string; telephone: string; numeroAutorisation: string }) => Promise<unknown>;
+  onDelete: (userId: string) => void;
+}) {
+  const [formOpen, setFormOpen] = useState(false);
+  const [nom, setNom] = useState("");
+  const [prenom, setPrenom] = useState("");
+  const [email, setEmail] = useState("");
+  const [telephone, setTelephone] = useState("");
+  const [numeroAutorisation, setNumeroAutorisation] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  const resetForm = () => {
+    setNom("");
+    setPrenom("");
+    setEmail("");
+    setTelephone("");
+    setNumeroAutorisation("");
+  };
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!nom.trim() || !prenom.trim()) return;
+    setSubmitting(true);
+    onCreate({ nom: nom.trim(), prenom: prenom.trim(), email: email.trim(), telephone: telephone.trim(), numeroAutorisation: numeroAutorisation.trim() })
+      .then(() => {
+        resetForm();
+        setFormOpen(false);
+      })
+      .catch(() => {
+        /* toast déjà affiché par le parent */
+      })
+      .finally(() => setSubmitting(false));
+  };
+
+  return (
+    <div className="space-y-4">
+      {!formOpen ? (
+        <button
+          type="button"
+          onClick={() => setFormOpen(true)}
+          className="flex w-full items-center justify-center gap-2 rounded-2xl bg-primary px-4 py-3 text-sm font-semibold text-primary-foreground transition hover:opacity-90"
+        >
+          <UserPlus className="h-4 w-4" /> Ajouter un moniteur
+        </button>
+      ) : (
+        <form onSubmit={handleSubmit} className="space-y-3 rounded-2xl border border-border bg-card p-4">
+          <div className="flex items-center justify-between">
+            <p className="text-sm font-semibold">Nouveau moniteur</p>
+            <button
+              type="button"
+              onClick={() => {
+                setFormOpen(false);
+                resetForm();
+              }}
+              className="grid h-7 w-7 place-items-center rounded-lg text-muted-foreground hover:bg-secondary"
+              aria-label="Fermer"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2">
+            <label className="block text-xs">
+              <span className="mb-1 block font-semibold text-muted-foreground">Prénom *</span>
+              <input
+                value={prenom}
+                onChange={(e) => setPrenom(e.target.value)}
+                required
+                className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm outline-none focus:border-primary"
+              />
+            </label>
+            <label className="block text-xs">
+              <span className="mb-1 block font-semibold text-muted-foreground">Nom *</span>
+              <input
+                value={nom}
+                onChange={(e) => setNom(e.target.value)}
+                required
+                className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm outline-none focus:border-primary"
+              />
+            </label>
+          </div>
+
+          <label className="block text-xs">
+            <span className="mb-1 block font-semibold text-muted-foreground">Email (optionnel)</span>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="prenom.nom@exemple.fr"
+              className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm outline-none focus:border-primary"
+            />
+          </label>
+
+          <div className="grid grid-cols-2 gap-2">
+            <label className="block text-xs">
+              <span className="mb-1 block font-semibold text-muted-foreground">Téléphone</span>
+              <input
+                value={telephone}
+                onChange={(e) => setTelephone(e.target.value)}
+                placeholder="06 12 34 56 78"
+                className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm outline-none focus:border-primary"
+              />
+            </label>
+            <label className="block text-xs">
+              <span className="mb-1 block font-semibold text-muted-foreground">N° autorisation</span>
+              <input
+                value={numeroAutorisation}
+                onChange={(e) => setNumeroAutorisation(e.target.value)}
+                placeholder="A-095-..."
+                className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm outline-none focus:border-primary"
+              />
+            </label>
+          </div>
+
+          <button
+            type="submit"
+            disabled={submitting || !nom.trim() || !prenom.trim()}
+            className="flex w-full items-center justify-center gap-2 rounded-xl bg-primary px-4 py-3 text-sm font-semibold text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <UserPlus className="h-4 w-4" />
+            {submitting ? "Création…" : "Créer le compte"}
+          </button>
+          <p className="text-[11px] text-muted-foreground">
+            Un identifiant et un mot de passe temporaire seront générés automatiquement et affichés après création — transmets-les au moniteur par un canal sécurisé.
+          </p>
+        </form>
+      )}
+
+      {loading && (
+        <div className="rounded-2xl border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
+          Chargement des moniteurs…
+        </div>
+      )}
+
+      {!loading && instructors.length === 0 && (
+        <div className="rounded-2xl border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
+          Aucun moniteur pour le moment.
+        </div>
+      )}
+
+      <div className="space-y-2">
+        {instructors.map((i) => (
+          <div key={i.userId} className="flex items-center gap-3 rounded-2xl border border-border bg-card p-4">
+            <div className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-primary/15 text-sm font-bold text-primary">
+              {i.prenom[0]}{i.nom[0]}
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-semibold">{i.prenom} {i.nom}</p>
+              <p className="truncate text-xs text-muted-foreground">@{i.username}</p>
+              <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+                {i.telephone && (
+                  <span className="inline-flex items-center gap-1">
+                    <Phone className="h-3 w-3" /> {i.telephone}
+                  </span>
+                )}
+                {i.numeroAutorisation && (
+                  <span className="inline-flex items-center gap-1">
+                    <BadgeCheck className="h-3 w-3" /> {i.numeroAutorisation}
+                  </span>
+                )}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => onDelete(i.userId)}
+              className="grid h-9 w-9 shrink-0 place-items-center rounded-lg text-destructive transition hover:bg-destructive/10"
+              aria-label={`Supprimer ${i.prenom} ${i.nom}`}
+            >
+              <Trash2 className="h-4 w-4" />
+            </button>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
